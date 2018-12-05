@@ -11,6 +11,7 @@ import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.sql.*;
 import scala.Tuple2;
 
+import javax.validation.constraints.Max;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -34,7 +35,7 @@ public class MetroLineNetUpdate {
 
             //读取数据源
             Dataset<MetroLineBean> rawMetroSchemeDS = readMetroTransferSchemeParquetAsDS(sparkSession, rawMetroSchemeDataDir);
-//                    .filter("routeName = '六号线' and stationName = '文化公园' and endStationName = '花都汽车城'");
+                    //.filter("routeName = '广佛线' and endRouteName = '四号线' and stationName = '菊树' and endStationName = '金洲'");
 
             Dataset<Row> rawMetroLocationDF = sparkSession.read().parquet(rawMetroLocationDataDir);
             Dataset<MetroLineBean> rawMetroStationWithOrderNumDS =
@@ -45,7 +46,7 @@ public class MetroLineNetUpdate {
 
             //为每个站点添加经纬度
             Dataset<Row> metroWithLocationDF = addLongLatToMetroTransferSchemaDS(metroWithSubStationDF, rawMetroLocationDF);
-            metroWithLocationDF.show(1000);
+
             //转换为JavaRDD<MetroLineBean>
             MetroBeanProcessor processor = new MetroBeanProcessor();
             JavaRDD<MetroLineBean> metroJavaRDD = processor.convertDatasetRowToMetroLineBean(sparkSession, metroWithLocationDF).toJavaRDD();
@@ -152,12 +153,12 @@ public class MetroLineNetUpdate {
                             List<MetroLineBean> allStationsInaTrip = new LinkedList<>();
                             List<MetroLineBean> transferStations = new LinkedList<>();
                             allStationsInaTrip.add(bean);
-                            if(checkIfIsTransferStation(bean)) transferStations.add(bean);
+                            if (checkIfIsTransferStation(bean)) transferStations.add(bean);
                             return new Tuple2<>(transferStations, allStationsInaTrip);
                         },
                         (stationsTuple, bean) -> {
                             stationsTuple._2.add(bean);
-                            if(checkIfIsTransferStation(bean)) stationsTuple._1.add(bean);
+                            if (checkIfIsTransferStation(bean)) stationsTuple._1.add(bean);
                             return stationsTuple;
                         },
                         (stationsTuple1, stationsTuple2) -> {
@@ -179,11 +180,26 @@ public class MetroLineNetUpdate {
 
                     //最后计算两两车站的距离，然后再算总和
                     Integer distance = 0;
-                    for(List<MetroLineBean> perRouteStations : stationsBwtOd) {
-                        for (int i = 0; i < perRouteStations.size()-1; i++) {
-                            MetroLineBean stationA = perRouteStations.get(i);
-                            MetroLineBean stationB = perRouteStations.get(i+1);
-                            if(stationA.getLongitude() != null && stationB.getLongitude() != null) {
+                    MetroLineBean beanWithLocationA = null;
+                    MetroLineBean beanWithLocationB = null;
+                    for (int i = 0; i < stationsBwtOd.size(); i++) {
+                        List<MetroLineBean> sortedBeans = stationsBwtOd.get(i).stream()
+                                .sorted(Comparator.comparing(bean -> bean.getSubStationNum())).collect(Collectors.toList());
+                        for (int x = 0; x < stationsBwtOd.get(i).size() - 1; x++) {
+                            MetroLineBean stationA = sortedBeans.get(x);
+                            MetroLineBean stationB = sortedBeans.get(x + 1);
+
+                            if(stationA.getLongitude() == null) {
+                                stationA = beanWithLocationA;
+                            }
+
+                            if(stationB.getLongitude() == null){
+                                stationB = beanWithLocationB;
+                            }
+
+                            if (stationA != null && stationB != null && stationA.getLongitude() != null && stationB.getLongitude() != null) {
+                                beanWithLocationA = stationA;
+                                beanWithLocationB = stationB;
                                 distance = distance + calDist(stationA, stationB);
                             }
                         }
@@ -193,7 +209,7 @@ public class MetroLineNetUpdate {
                             .flatMap(list -> list.stream())
                             .collect(Collectors.toList());
 
-                    for(MetroLineBean bean : result) {
+                    for (MetroLineBean bean : result) {
                         bean.setDistance(distance);
                     }
 
@@ -205,30 +221,33 @@ public class MetroLineNetUpdate {
 
     private static List<List<MetroLineBean>> getStationsBwtOD(List<MetroLineBean> oStations, List<MetroLineBean> dStations, List<MetroLineBean> allStations) {
         List<List<MetroLineBean>> stationsBwtOd = new LinkedList<>();
-        for(int i = 0; i < oStations.size()-1; i++) {
-           MetroLineBean transferStationA = oStations.get(i);
-           MetroLineBean transferStationB = dStations.get(i);
-           List<MetroLineBean> stationsInRoute = allStations.stream()
-                   .filter(bean->bean.getTransNum().equals(transferStationA.getTransNum())).collect(Collectors.toList());
-           if(transferStationA.getSubStationNum() < transferStationB.getSubStationNum()) {
-               stationsBwtOd.add(getStationsBwtTwo(transferStationA, transferStationB, stationsInRoute));
-           } else {
-               stationsBwtOd.add(getStationsBwtTwo(transferStationB, transferStationA,stationsInRoute));
-           }
+        for (int i = 0; i < oStations.size() - 1; i++) {
+            MetroLineBean transferStationA = oStations.get(i);
+            MetroLineBean transferStationB = dStations.get(i);
+            List<MetroLineBean> stationsInRoute = allStations.stream()
+                    .filter(bean -> bean.getTransNum().equals(transferStationA.getTransNum()))
+                    .sorted(Comparator.comparing(bean -> bean.getTransNum()))
+                    .collect(Collectors.toList());
+            if (transferStationA.getSubStationNum() < transferStationB.getSubStationNum()) {
+                stationsBwtOd.add(getStationsBwtTwo(transferStationA, transferStationB, stationsInRoute));
+            } else {
+                stationsBwtOd.add(getStationsBwtTwo(transferStationB, transferStationA, stationsInRoute));
+            }
         }
         return stationsBwtOd;
     }
 
     private static List<MetroLineBean> getStationsBwtTwo(MetroLineBean stationA, MetroLineBean stationB, List<MetroLineBean> stations) {
-        return stations.stream().filter(bean -> stationA.getSubStationNum() <= bean.getSubStationNum()
+        List<MetroLineBean> result = stations.stream().filter(bean -> stationA.getSubStationNum() <= bean.getSubStationNum()
                 && stationB.getSubStationNum() >= bean.getSubStationNum()).collect(Collectors.toList());
+        return result;
     }
 
     private static List<MetroLineBean> inferDfromO(List<MetroLineBean> odStations, List<MetroLineBean> allStations) {
         List<MetroLineBean> dStationsOrderNumList = new LinkedList<>();
-        for(int i = 0; i < odStations.size()-1; i ++) {
+        for (int i = 0; i < odStations.size() - 1; i++) {
             MetroLineBean stationBeforeTransfer = odStations.get(i);
-            MetroLineBean stationAfterTransfer = odStations.get(i+1);
+            MetroLineBean stationAfterTransfer = odStations.get(i + 1);
             MetroLineBean dStation = allStations.stream()
                     .filter(bean -> bean.getTransRoute().equals(stationBeforeTransfer.getTransRoute())
                             && bean.getSubStation().equals(stationAfterTransfer.getSubStation())).findAny().get();
@@ -239,7 +258,7 @@ public class MetroLineNetUpdate {
     }
 
     private static boolean checkIfIsTransferStation(MetroLineBean bean) {
-        if(bean.getSubStation().equals(bean.getTransStation())) {
+        if (bean.getSubStation().equals(bean.getTransStation())) {
             return true;
         } else {
             return false;
@@ -252,7 +271,7 @@ public class MetroLineNetUpdate {
         Double long2 = Double.valueOf(bean2.getLongitude());
         Double lat2 = Double.valueOf(bean2.getLatitude());
         Double distance = LocationUtils.getDistance(long1, lat1, long2, lat2);
+        //System.out.println(bean1.getSubStation() + ": " + long1 + ", " + lat1 + ". " + bean2.getSubStation() + ": " + long1 + ", " + lat1 + ". Distance: " + distance);
         return distance.intValue();
-
     }
 }
