@@ -117,7 +117,7 @@ public class MetroBeanProcessor implements Serializable {
         metroLineBean.setTransNum(id);
         return metroLineBean;
     }
-    private String cleanContent(String content) {
+    public String cleanContent(String content) {
         if(content != null) {
             String beforeStr = content;
             //先去除空格

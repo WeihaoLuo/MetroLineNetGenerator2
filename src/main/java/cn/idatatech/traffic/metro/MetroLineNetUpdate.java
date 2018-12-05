@@ -4,11 +4,13 @@ import cn.idatatech.traffic.metro.Entity.MetroLineBean;
 import cn.idatatech.traffic.metro.Utils.LocationUtils;
 import cn.idatatech.traffic.metro.Utils.MetroBeanProcessor;
 import cn.idatatech.traffic.metro.Utils.MetroDataCollector;
+import net.bytebuddy.TypeCache;
 import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.sql.*;
 import scala.Tuple2;
+
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -17,7 +19,7 @@ public class MetroLineNetUpdate {
         if (args.length == 3) {
             // 配置spark
             SparkConf sparkConf = new SparkConf()
-                    .setMaster("local[1]")
+                    .setMaster("local[*]")
                     .setAppName(MetroLineNetUpdate.class.getName())
                     .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer");
             JavaSparkContext javaSparkContext = new JavaSparkContext(sparkConf);
@@ -32,6 +34,8 @@ public class MetroLineNetUpdate {
 
             //读取数据源
             Dataset<MetroLineBean> rawMetroSchemeDS = readMetroTransferSchemeParquetAsDS(sparkSession, rawMetroSchemeDataDir);
+//                    .filter("routeName = '六号线' and stationName = '文化公园' and endStationName = '花都汽车城'");
+
             Dataset<Row> rawMetroLocationDF = sparkSession.read().parquet(rawMetroLocationDataDir);
             Dataset<MetroLineBean> rawMetroStationWithOrderNumDS =
                     readMetroStationWithOrderNumDataAsDS(sparkSession, javaSparkContext, rawMetroStationWithOrderNumDataDir);
@@ -40,11 +44,8 @@ public class MetroLineNetUpdate {
             Dataset<Row> metroWithSubStationDF = addSubStationsToMetroTransferSchemaDS(rawMetroSchemeDS, rawMetroStationWithOrderNumDS);
 
             //为每个站点添加经纬度
-            Dataset<Row> metroWithLocationDF = addLongLatToMetroTransferSchemaDS(metroWithSubStationDF, rawMetroLocationDF)
-                    .filter("stationName = '金峰' and endStationName = '新塘'")
-                    .orderBy("uuid", "transNum", "subStationNum");
+            Dataset<Row> metroWithLocationDF = addLongLatToMetroTransferSchemaDS(metroWithSubStationDF, rawMetroLocationDF);
             metroWithLocationDF.show(1000);
-
             //转换为JavaRDD<MetroLineBean>
             MetroBeanProcessor processor = new MetroBeanProcessor();
             JavaRDD<MetroLineBean> metroJavaRDD = processor.convertDatasetRowToMetroLineBean(sparkSession, metroWithLocationDF).toJavaRDD();
@@ -68,7 +69,7 @@ public class MetroLineNetUpdate {
                     "subStation",
                     "longitude",
                     "latitude"
-            ).show();
+            ).show(1000);
         } else {
             System.err.println(
                     "Application require three arguments. " +
@@ -82,8 +83,7 @@ public class MetroLineNetUpdate {
 
     private static Dataset<MetroLineBean> readMetroTransferSchemeParquetAsDS(SparkSession sparkSession, String dataDir) {
         MetroBeanProcessor beanMaker = new MetroBeanProcessor();
-        Dataset<Row> dataDF = sparkSession.read().parquet(dataDir)
-                .filter("lines_result is not null");
+        Dataset<Row> dataDF = sparkSession.read().parquet(dataDir).filter("lines_result is not null");
         Dataset<MetroLineBean> beanDataDS = beanMaker.packRawDataAsMetroLineBeansRDD(sparkSession, dataDF);
         return beanDataDS;
     }
@@ -91,11 +91,12 @@ public class MetroLineNetUpdate {
     private static Dataset<MetroLineBean> readMetroStationWithOrderNumDataAsDS(SparkSession sparkSession, JavaSparkContext javaSparkContext, String chromeDriverPath) {
         MetroDataCollector metroDataCollector = new MetroDataCollector(chromeDriverPath);
         List<String[]> data = new ArrayList<>(metroDataCollector.getStationsFromMetro());
+        MetroBeanProcessor processor = new MetroBeanProcessor();
         List<MetroLineBean> packagedBeanList = data.stream().map(row -> {
             MetroLineBean metroLineBean = new MetroLineBean();
-            metroLineBean.setRouteName(row[0]);
+            metroLineBean.setRouteName(processor.cleanContent(row[0]));
             metroLineBean.setSubStationNum(Integer.parseInt(row[1]));
-            metroLineBean.setSubStation(row[2]);
+            metroLineBean.setSubStation(processor.cleanContent(row[2]));
             return metroLineBean;
         }).collect(Collectors.toList());
         Dataset<MetroLineBean> result = sparkSession.createDataFrame(javaSparkContext.parallelize(packagedBeanList), MetroLineBean.class)
@@ -116,8 +117,8 @@ public class MetroLineNetUpdate {
 
         //添加换乘需要路过的站点
         Dataset<Row> metroWithSubStationDF = metroSchemeDF
-                .join(newSubStationDS,metroSchemeRouteName.equalTo(metroSubStationsRouteName), "leftOuter")
-                .dropDuplicates("uuid","transRoute", "transStation", "subStation")
+                .join(newSubStationDS, metroSchemeRouteName.equalTo(metroSubStationsRouteName), "leftOuter")
+                .dropDuplicates("uuid", "transRoute", "transStation", "subStation")
                 .drop(metroSubStationsRouteName);
         return metroWithSubStationDF;
     }
@@ -138,7 +139,7 @@ public class MetroLineNetUpdate {
         Dataset<Row> metroWithLocationDF = metroSchemeDF.join(
                 newMetroLocationDF,
                 metroSchemeSubStation.equalTo(metroLocationStationName), "leftOuter")
-                .dropDuplicates("uuid","transRoute", "transStation", "subStation", "longitude", "latitude")
+                .dropDuplicates("uuid", "transRoute", "transStation", "subStation", "longitude", "latitude")
                 .drop(metroLocationRouteName)
                 .drop(metroLocationStationName);
         return metroWithLocationDF;
@@ -148,84 +149,102 @@ public class MetroLineNetUpdate {
         JavaRDD<MetroLineBean> resutlRDD = data.mapToPair(bean -> new Tuple2<>(bean.getUuid(), bean))
                 .combineByKey(
                         bean -> {
-                            List<MetroLineBean> beanList = new LinkedList<>();
-                            beanList.add(bean);
-                            return beanList;
+                            List<MetroLineBean> allStationsInaTrip = new LinkedList<>();
+                            List<MetroLineBean> transferStations = new LinkedList<>();
+                            allStationsInaTrip.add(bean);
+                            if(checkIfIsTransferStation(bean)) transferStations.add(bean);
+                            return new Tuple2<>(transferStations, allStationsInaTrip);
                         },
-                        (beanList, bean) -> {
-                            beanList.add(bean);
-                            return beanList;
+                        (stationsTuple, bean) -> {
+                            stationsTuple._2.add(bean);
+                            if(checkIfIsTransferStation(bean)) stationsTuple._1.add(bean);
+                            return stationsTuple;
                         },
-                        (beanList1, beanList2) -> {
-                            beanList1.addAll(beanList2);
-                            return beanList1;
+                        (stationsTuple1, stationsTuple2) -> {
+                            stationsTuple1._1.addAll(stationsTuple2._1);
+                            stationsTuple1._2.addAll(stationsTuple2._2);
+                            return stationsTuple1;
                         }
                 )
                 .map(t -> {
-                    List<MetroLineBean> metroBeansList = t._2;
-                    List<MetroLineBean[]> odTransferStationEachRoute = getODTransferStationInEachRoute(metroBeansList);
+                    List<MetroLineBean> metroBeanList = t._2._2;
 
-                    //计算乘坐地铁od总距离
+                    //通过入站o点，推导路线内的另一个换乘站点(d点)，保存每个o点推导出来d点的站序号到List中
+                    List<MetroLineBean> oStations = t._2._1;
+                    oStations.sort(Comparator.comparing(bean -> bean.getTransNum()));
+                    List<MetroLineBean> dStations = inferDfromO(oStations, metroBeanList);
+
+                    //筛选数据，先留下换乘线路相同的站点
+                    List<List<MetroLineBean>> stationsBwtOd = getStationsBwtOD(oStations, dStations, metroBeanList);
+
+                    //最后计算两两车站的距离，然后再算总和
                     Integer distance = 0;
-                    for (int i = 0; i < odTransferStationEachRoute.size()-1; i++) {
-                        MetroLineBean transferStartStation = odTransferStationEachRoute.get(i)[0];
-                        MetroLineBean transferEndStation = odTransferStationEachRoute.get(i)[1];
-                        System.out.println("1. looking for: " + transferStartStation.toString());
-                        System.out.println("2. looking for: " + transferEndStation.toString());
-                        distance = distance + calDistBwtTransferStations(metroBeansList, transferStartStation, transferEndStation);
+                    for(List<MetroLineBean> perRouteStations : stationsBwtOd) {
+                        for (int i = 0; i < perRouteStations.size()-1; i++) {
+                            MetroLineBean stationA = perRouteStations.get(i);
+                            MetroLineBean stationB = perRouteStations.get(i+1);
+                            if(stationA.getLongitude() != null && stationB.getLongitude() != null) {
+                                distance = distance + calDist(stationA, stationB);
+                            }
+                        }
                     }
 
-                    //bean赋值
-                    List<MetroLineBean> result = new LinkedList<>();
-                    for (MetroLineBean[] beanArray : odTransferStationEachRoute) {
-                        beanArray[0].setDistance(distance);
-                        result.add(beanArray[0]);
+                    List<MetroLineBean> result = stationsBwtOd.stream()
+                            .flatMap(list -> list.stream())
+                            .collect(Collectors.toList());
+
+                    for(MetroLineBean bean : result) {
+                        bean.setDistance(distance);
                     }
+
                     return result;
+
                 }).flatMap(list -> list.listIterator());
         return resutlRDD;
     }
 
-    private static Integer calDistBwtTransferStations(List<MetroLineBean> beanList, MetroLineBean transferStartStation, MetroLineBean transferEndStation) {
-        //找出换站od两站之间经过所有的站点，并排序
-        List<MetroLineBean> sameRouteStations = beanList.stream()
-                .filter(bean -> bean.getTransNum().equals(transferStartStation.getTransNum())
-                        && bean.getSubStationNum() >= transferStartStation.getSubStationNum()
-                        && bean.getSubStationNum() <= transferEndStation.getSubStationNum())
-                .sorted(Comparator.comparing(bean -> bean.getSubStationNum()))
-                .collect(Collectors.toList());
-        System.out.println("##################################################");
-        sameRouteStations.forEach(line -> System.out.println(line.toString()));
-
-        //计算距离
-        int distance = 0;
-
-        for (int i = 0; i < sameRouteStations.size() - 1; i++) {
-            if (sameRouteStations.get(i).getLongitude() != null && sameRouteStations.get(i + 1).getLongitude() != null) {
-                distance = distance + calDist(sameRouteStations.get(i), sameRouteStations.get(i + 1));
-            } else {
-                distance -= 100;
-            }
+    private static List<List<MetroLineBean>> getStationsBwtOD(List<MetroLineBean> oStations, List<MetroLineBean> dStations, List<MetroLineBean> allStations) {
+        List<List<MetroLineBean>> stationsBwtOd = new LinkedList<>();
+        for(int i = 0; i < oStations.size()-1; i++) {
+           MetroLineBean transferStationA = oStations.get(i);
+           MetroLineBean transferStationB = dStations.get(i);
+           List<MetroLineBean> stationsInRoute = allStations.stream()
+                   .filter(bean->bean.getTransNum().equals(transferStationA.getTransNum())).collect(Collectors.toList());
+           if(transferStationA.getSubStationNum() < transferStationB.getSubStationNum()) {
+               stationsBwtOd.add(getStationsBwtTwo(transferStationA, transferStationB, stationsInRoute));
+           } else {
+               stationsBwtOd.add(getStationsBwtTwo(transferStationB, transferStationA,stationsInRoute));
+           }
         }
-        return distance;
+        return stationsBwtOd;
     }
 
-    private static List<MetroLineBean[]> getODTransferStationInEachRoute(List<MetroLineBean> data) {
-        //每个数组代表当前线路的上车下车站点
-        List<MetroLineBean[]> odTransferStationEachRoute = new LinkedList<>();
-
-        //去除不是换乘车站的站点，然后对换乘站点进行排序
-        List<MetroLineBean> transferStations = data.stream()
-                .filter(bean -> bean.getTransStation().equals(bean.getSubStation()))
-                .sorted(Comparator.comparing(bean -> bean.getTransNum())).collect(Collectors.toList());
-
-        //以两两换乘站点为一个数据放入list中。
-        for (int i = 0; i < transferStations.size() - 1; i++) {
-            odTransferStationEachRoute.add(new MetroLineBean[]{transferStations.get(i), transferStations.get(i + 1)});
-        }
-        return odTransferStationEachRoute;
+    private static List<MetroLineBean> getStationsBwtTwo(MetroLineBean stationA, MetroLineBean stationB, List<MetroLineBean> stations) {
+        return stations.stream().filter(bean -> stationA.getSubStationNum() <= bean.getSubStationNum()
+                && stationB.getSubStationNum() >= bean.getSubStationNum()).collect(Collectors.toList());
     }
 
+    private static List<MetroLineBean> inferDfromO(List<MetroLineBean> odStations, List<MetroLineBean> allStations) {
+        List<MetroLineBean> dStationsOrderNumList = new LinkedList<>();
+        for(int i = 0; i < odStations.size()-1; i ++) {
+            MetroLineBean stationBeforeTransfer = odStations.get(i);
+            MetroLineBean stationAfterTransfer = odStations.get(i+1);
+            MetroLineBean dStation = allStations.stream()
+                    .filter(bean -> bean.getTransRoute().equals(stationBeforeTransfer.getTransRoute())
+                            && bean.getSubStation().equals(stationAfterTransfer.getSubStation())).findAny().get();
+            dStationsOrderNumList.add(dStation);
+        }
+
+        return dStationsOrderNumList;
+    }
+
+    private static boolean checkIfIsTransferStation(MetroLineBean bean) {
+        if(bean.getSubStation().equals(bean.getTransStation())) {
+            return true;
+        } else {
+            return false;
+        }
+    }
 
     private static Integer calDist(MetroLineBean bean1, MetroLineBean bean2) {
         Double long1 = Double.valueOf(bean1.getLongitude());
