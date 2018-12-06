@@ -23,7 +23,7 @@
                     <finalName>MetroLineNetGenApp</finalName>
                     <archive>
                         <manifest>
-                            <mainClass>cn.idatatech.traffic.metro.Utils.MetroDataCollector</mainClass>
+                            <mainClass>cn.idatatech.traffic.metro.Utils.MetroDataCrawler</mainClass>
                         </manifest>
                     </archive>
                     <descriptorRefs>

@@ -1,4 +1,4 @@
-package cn.idatatech.traffic.metro.Utils;
+package cn.idatatech.traffic.metro.Utils.Common;
 
 /**
  * 经纬度距离计算工具类 

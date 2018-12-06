@@ -12,10 +12,10 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 
-public class MetroDataCollector {
+public class MetroDataCrawler {
     private WebDriver driver;
 
-    public MetroDataCollector(String chromeDriverPath) {
+    public MetroDataCrawler(String chromeDriverPath) {
         prepareDriver(chromeDriverPath);
     }
 
